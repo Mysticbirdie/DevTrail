@@ -305,20 +305,29 @@ def search_sessions(conn: sqlite3.Connection, query: str, limit: int = 10) -> Li
     return [dict(row) for row in cursor.fetchall()]
 
 
-def get_recent_sessions(conn: sqlite3.Connection, days: int = 7, tool: Optional[str] = None) -> List[Dict]:
-    """Get recent sessions."""
+def get_recent_sessions(
+    conn: sqlite3.Connection,
+    days: int = 7,
+    tool: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> List[Dict]:
+    """Get recent sessions, optionally capped to `limit` results."""
     query = """
         SELECT * FROM sessions
         WHERE started_at >= datetime('now', '-{} days')
     """.format(days)
-    
+
     params = []
     if tool:
         query += " AND tool = ?"
         params.append(tool)
-    
+
     query += " ORDER BY started_at DESC"
-    
+
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(int(limit))
+
     cursor = conn.execute(query, params)
     return [dict(row) for row in cursor.fetchall()]
 
