@@ -436,6 +436,43 @@ class DevTrailMCPServer:
         except Exception as e:
             return {"error": str(e), "dry_run": dry_run}
 
+    def tool_refine(self, args: Dict) -> Dict:
+        """Sync DevTrail patterns/decisions/sessions into a project's lessons file.
+
+        Tool-agnostic self-improvement bridge: extracts intelligence from the
+        DevTrail DB and merges it into the project's .devin/lessons.json (or
+        .claude/lessons.json, .cursor/lessons.json, etc.). Call after extraction
+        or at session end to feed cross-session learning.
+        """
+        import os
+        from memory.self_improvement import sync_lessons, load_lessons
+        from pathlib import Path
+
+        project_dir = Path(args.get("project_dir", os.getcwd()))
+        dry_run = args.get("dry_run", False)
+        db_path = DB_PATH
+
+        # Auto-detect lessons file
+        lessons_file_arg = args.get("lessons_file", "")
+        if lessons_file_arg:
+            lessons_path = Path(lessons_file_arg)
+        else:
+            for candidate in [
+                project_dir / ".devin" / "lessons.json",
+                project_dir / ".claude" / "lessons.json",
+                project_dir / ".cursor" / "lessons.json",
+                project_dir / ".agents" / "lessons.json",
+            ]:
+                if candidate.exists():
+                    lessons_path = candidate
+                    break
+            else:
+                lessons_path = project_dir / ".devin" / "lessons.json"
+
+        result = sync_lessons(db_path, lessons_path, dry_run=dry_run)
+        result["lessons_file"] = str(lessons_path)
+        return result
+
     def tool_capture_session(self, args: Dict) -> Dict:
         """Manually capture a session into DevTrail memory.
 
@@ -894,6 +931,18 @@ TOOLS = [
                 "session_id": {"type": "string", "description": "Specific session ID to compact"},
                 "workspace": {"type": "string", "description": "Aggregate all recent sessions in a workspace"},
                 "format": {"type": "string", "enum": ["dict", "markdown", "injection"], "default": "dict", "description": "Output format: structured dict, markdown, or single-paragraph injection string"},
+            },
+        },
+    },
+    {
+        "name": "devtrail_refine",
+        "description": "Sync DevTrail's extracted patterns, decisions, and high-importance sessions into a project's self-improvement lessons file (.devin/lessons.json, .claude/lessons.json, etc.). Tool-agnostic — works with any project that has a lessons file. Call after extraction or at session end to feed cross-session learning.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string", "description": "Path to project root. Defaults to current working directory."},
+                "lessons_file": {"type": "string", "description": "Explicit path to lessons.json. Auto-detected if omitted (checks .devin/, .claude/, .cursor/, .agents/)."},
+                "dry_run": {"type": "boolean", "default": False, "description": "Preview what would be synced without writing."},
             },
         },
     },

@@ -345,6 +345,7 @@ For Windsurf/Cascade, add to your user settings under `mcpServers`.
 | `devtrail_sync` | Sync to IDE memory banks |
 | `devtrail_capture_session` | Push current session into memory |
 | `devtrail_project_brain` | Read project brain docs |
+| `devtrail_refine` | Sync patterns/decisions into project's self-improvement lessons file |
 
 **How it works:**
 
@@ -359,6 +360,96 @@ For Windsurf/Cascade, add to your user settings under `mcpServers`.
                  │ Devin/Cursor │
                  │ Claude/Git   │
                  └──────────────┘
+```
+
+## Self-Improvement Bridge (Cross-Session Learning)
+
+DevTrail can feed its extracted intelligence (patterns, decisions, high-importance sessions) back into a project's self-improvement file — a `lessons.json` that accumulates reusable lessons across sessions and tools.
+
+**How it works:**
+
+```
+Session ends (any tool)
+  → DevTrail extracts patterns, decisions, sessions
+  → self_improvement.py merges them into the project's lessons.json
+  → Next session starts → lessons.json is loaded into context
+  → Agent avoids repeating failures, follows established patterns
+```
+
+The lessons file is tool-agnostic. DevTrail auto-detects it in these locations (checked in order):
+
+- `.devin/lessons.json` (Devin)
+- `.claude/lessons.json` (Claude Code)
+- `.cursor/lessons.json` (Cursor)
+- `.agents/lessons.json` (generic)
+
+**Lesson format:**
+
+```json
+{
+  "lessons": [
+    {
+      "id": "l_pattern_...",
+      "content": "[fix] Embedding generation: replace embed() function",
+      "category": "pattern | decision | failure_avoidance | session_summary",
+      "source": "devtrail_sync_<timestamp>",
+      "created": 1786302708,
+      "times_reinforced": 3
+    }
+  ],
+  "last_updated": 1786302708
+}
+```
+
+Repeated lessons (same pattern seen across sessions) are deduplicated and their `times_reinforced` counter increments — so frequently recurring patterns rise to the top.
+
+**Usage:**
+
+```bash
+# Sync DevTrail intelligence into a project's lessons file
+python3 memory/self_improvement.py --sync-lessons \
+  --project-dir /path/to/project
+
+# Preview without writing
+python3 memory/self_improvement.py --sync-lessons \
+  --project-dir /path/to/project --dry-run
+
+# Show current lessons
+python3 memory/self_improvement.py --show-lessons \
+  --lessons-file /path/to/project/.devin/lessons.json
+```
+
+**Via MCP (from your IDE agent):**
+
+Call `devtrail_refine` with `project_dir` to sync lessons programmatically. The agent can call this at session end or after extraction.
+
+**Via session-end hook (automatic):**
+
+The `hooks/session-end-extract.sh` script runs DevTrail extraction + lesson sync automatically when a session ends. Install it in your tool's hook system:
+
+```json
+// Devin (.devin/hooks.v1.json)
+{
+  "SessionEnd": [
+    { "matcher": "", "hooks": [
+      { "type": "command",
+        "command": "bash /path/to/DevTrail/hooks/session-end-extract.sh",
+        "timeout": 30 }
+    ]}
+  ]
+}
+```
+
+For Claude CLI, source it in your shell:
+
+```bash
+source /path/to/DevTrail/hooks/session-end-extract.sh
+```
+
+For other tools, run it manually or via a post-session script:
+
+```bash
+bash /path/to/DevTrail/hooks/session-end-extract.sh /path/to/project
 ```
 
 ## Project Brains
