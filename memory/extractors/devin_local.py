@@ -23,20 +23,30 @@ class DevinLocalExtractor(BaseExtractor):
     
     # Primary database location
     DIPS_DB = Path.home() / "Library" / "Application Support" / "Windsurf" / "DIPS"
-    
+
+    # Devin CLI/app session store — the CANONICAL live transcript
+    # source (Windsurf paths above are legacy/dead). Tables:
+    #   sessions(id, working_directory, title, created_at,
+    #            last_activity_at, hidden)
+    #   message_nodes(session_id, node_id, chat_message json{role,
+    #            content}, created_at)
+    SESSIONS_DB = Path.home() / ".local" / "share" / "devin" / "cli" / "sessions.db"
+    TURN_CONTENT_CAP = 50_000  # bytes per turn; bounds raw_content
+
     # Cached data directory
     CACHED_DATA = Path.home() / "Library" / "Application Support" / "Windsurf" / "CachedData"
-    
+
     # Claude logs directory (contains actual conversations)
     LOGS_DIR = Path.home() / "Library" / "Application Support" / "Windsurf" / "logs"
-    
+
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or self.DIPS_DB
         self.sessions: List[Dict] = []
-    
+
     def is_available(self) -> bool:
         """Check if Devin Local data is accessible."""
-        return self.db_path.exists() or self.CACHED_DATA.exists() or self.LOGS_DIR.exists()
+        return (self.SESSIONS_DB.exists() or self.db_path.exists()
+                or self.CACHED_DATA.exists() or self.LOGS_DIR.exists())
     
     def get_stats(self) -> Dict:
         """Return statistics about available Devin Local data."""
@@ -98,8 +108,15 @@ class DevinLocalExtractor(BaseExtractor):
             }]
         
         sessions = []
-        
-        # Try SQLite database first
+
+        # Devin CLI sessions.db first — the live canonical store.
+        if self.SESSIONS_DB.exists():
+            try:
+                sessions.extend(self._extract_from_sessions_db(limit))
+            except Exception as e:
+                print(f"  Warning: Could not read sessions.db: {e}")
+
+        # Legacy: Windsurf DIPS database
         if self.db_path.exists():
             try:
                 sessions.extend(self._extract_from_dips(limit))
@@ -245,6 +262,117 @@ class DevinLocalExtractor(BaseExtractor):
             "turns": turns
         }
     
+    def _extract_from_sessions_db(self, limit: Optional[int] = None) -> List[Dict]:
+        """Extract live Devin CLI/app sessions from sessions.db.
+
+        WAL mode: copy the -wal/-shm sidecars too, else the most recent
+        writes are invisible in the copied DB.
+        """
+        sessions = []
+
+        temp_db = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
+                temp_db = tmp.name
+            shutil.copy2(str(self.SESSIONS_DB), temp_db)
+            for suffix in ("-wal", "-shm"):
+                side = Path(str(self.SESSIONS_DB) + suffix)
+                if side.exists():
+                    shutil.copy2(str(side), temp_db + suffix)
+        except Exception as e:
+            print(f"Warning: Could not copy sessions.db: {e}")
+            return sessions
+
+        try:
+            conn = sqlite3.connect(temp_db)
+            conn.row_factory = sqlite3.Row
+
+            q = ("SELECT id, working_directory, title, created_at, "
+                 "last_activity_at FROM sessions WHERE hidden = 0 "
+                 "ORDER BY last_activity_at DESC")
+            if limit:
+                q += f" LIMIT {int(limit)}"
+            rows = conn.execute(q).fetchall()
+
+            for row in rows:
+                try:
+                    session = self._parse_sessions_db_row(conn, row)
+                    if session:
+                        sessions.append(session)
+                except Exception as e:
+                    print(f"Warning: skipping session {row['id']}: {e}")
+                    continue
+
+            conn.close()
+        except Exception as e:
+            print(f"sessions.db extraction failed: {e}")
+        finally:
+            if temp_db:
+                for suffix in ("", "-wal", "-shm"):
+                    p = temp_db + suffix
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+
+        return sessions
+
+    def _parse_sessions_db_row(self, conn: sqlite3.Connection,
+                               row: sqlite3.Row) -> Optional[Dict]:
+        sid = row["id"]
+        msgs = conn.execute(
+            "SELECT chat_message, created_at FROM message_nodes "
+            "WHERE session_id = ? ORDER BY row_id", (sid,)).fetchall()
+        if not msgs:
+            return None
+
+        turns = []
+        for m in msgs:
+            try:
+                msg = json.loads(m["chat_message"])
+            except Exception:
+                continue
+            role = msg.get("role") or "unknown"
+            content = msg.get("content")
+            if isinstance(content, list):
+                content = "\n".join(
+                    part.get("text", "") if isinstance(part, dict)
+                    else str(part) for part in content)
+            if not content:
+                continue
+            content = str(content)[:self.TURN_CONTENT_CAP]
+            ts = m["created_at"]
+            try:
+                ts = datetime.fromtimestamp(int(ts)).isoformat()
+            except Exception:
+                ts = str(ts)
+            turns.append({"role": role, "content": content,
+                          "timestamp": ts})
+        if not turns:
+            return None
+
+        started = row["created_at"]
+        ended = row["last_activity_at"]
+        try:
+            started = datetime.fromtimestamp(int(started)).isoformat()
+            ended = datetime.fromtimestamp(int(ended)).isoformat()
+        except Exception:
+            pass
+
+        summary = row["title"] or self._generate_summary(turns)
+        return {
+            "tool": self.TOOL_NAME,
+            "session_id": f"devincli_{sid}",
+            "started_at": started,
+            "ended_at": ended,
+            "summary": summary,
+            "workspace": row["working_directory"],
+            "tags": self._extract_tags(turns),
+            "raw_content": json.dumps(turns),
+            "turns": turns,
+        }
+
     def _extract_from_cache(self, limit: Optional[int] = None) -> List[Dict]:
         """Extract from Devin Local's cached data files."""
         sessions = []
