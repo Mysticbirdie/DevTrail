@@ -45,6 +45,10 @@ from memory.bridge import sync_all
 AUTO_EXTRACT_INTERVAL_HOURS = 24  # Auto-extract if DB is older than this
 AUTO_EXTRACT_ON_STARTUP = True    # Run background extraction when server starts
 BACKGROUND_EXTRACT_MIN_AGE = 5    # Minutes: don't re-extract if done this recently
+# Wall-clock ceiling for any single tool request's DB work. The serving loop
+# is single-threaded — one pathological query (leading-wildcard LIKE over a
+# multi-GB turns table) would otherwise wedge every subsequent MCP call.
+QUERY_BUDGET_S = float(os.environ.get("DEVTRAIL_QUERY_BUDGET_S", "15"))
 
 # ── MCP Protocol Helpers ────────────────────────────────────────────────────
 
@@ -84,10 +88,15 @@ class DevTrailMCPServer:
         self._extract_lock = threading.Lock()
         self._db_path = DB_PATH
 
+    def _read_db(self):
+        """Request-scoped DB connection for tool handlers — bounded so a
+        runaway query errors out instead of hanging the serving loop."""
+        return init_db(query_budget_s=QUERY_BUDGET_S)
+
     def _ensure_db(self):
         """Initialize DB if needed."""
         if not self._db_path.exists():
-            conn = init_db()
+            conn = self._read_db()
             conn.close()
 
     def _run_auto_extract(self):
@@ -100,7 +109,7 @@ class DevTrailMCPServer:
                     return
 
             try:
-                conn = init_db()
+                conn = init_db()  # long-lived extraction conn — no query budget
                 extractor = EntityExtractor()
                 summarizer = SessionSummarizer()
                 importance_scorer = ImportanceScorer()
@@ -191,7 +200,7 @@ class DevTrailMCPServer:
         if not query:
             return {"results": [], "message": "No query provided"}
 
-        conn = init_db()
+        conn = self._read_db()
         if workspace or min_importance is not None:
             results = search_sessions_scoped(conn, query, workspace=workspace, min_importance=min_importance, limit=limit)
         else:
@@ -220,7 +229,7 @@ class DevTrailMCPServer:
         """Get recent sessions across all tools."""
         days = args.get("days", 7)
         limit = args.get("limit", 20)
-        conn = init_db()
+        conn = self._read_db()
         results = get_recent_sessions(conn, days=days, limit=limit)
         conn.close()
 
@@ -237,10 +246,37 @@ class DevTrailMCPServer:
             ]
         }
 
+    def tool_stella(self, args: Dict) -> Dict:
+        """Query the local Stella topology store (persistent, T1/T2+octa)."""
+        from memory.stella_store import get_store
+
+        store = get_store()
+        action = args.get("action", "stats")
+
+        if action == "stats":
+            return store.status()
+
+        if action == "query":
+            return store.query(
+                text=args.get("text"),
+                k=int(args.get("k", 4)),
+                face=args.get("face", "ALL"),
+                backend=args.get("backend"),
+            )
+
+        if action == "parity":
+            return store.parity_report(
+                text=args.get("text", ""),
+                k=int(args.get("k", 4)),
+            )
+
+        return {"error": f"unknown action '{action}' (use 'stats', 'query', or 'parity')"}
+
+
     def tool_decisions(self, args: Dict) -> Dict:
         """Get active architectural decisions."""
         limit = args.get("limit", 20)
-        conn = init_db()
+        conn = self._read_db()
         results = get_active_decisions(conn, limit=limit)
         conn.close()
 
@@ -261,7 +297,7 @@ class DevTrailMCPServer:
 
     def tool_patterns(self, args: Dict) -> Dict:
         """Get learned patterns and conventions."""
-        conn = init_db()
+        conn = self._read_db()
         cursor = conn.execute(
             """
             SELECT pattern_type, description, code_example, created_at
@@ -289,7 +325,7 @@ class DevTrailMCPServer:
 
     def tool_entities(self, args: Dict) -> Dict:
         """Get extracted entities (libraries, systems, technologies)."""
-        conn = init_db()
+        conn = self._read_db()
         results = get_entities(conn, limit=args.get("limit", 50))
         conn.close()
 
@@ -308,7 +344,7 @@ class DevTrailMCPServer:
 
     def tool_stats(self, args: Dict) -> Dict:
         """Get database statistics."""
-        conn = init_db()
+        conn = self._read_db()
         stats = get_stats(conn)
         conn.close()
 
@@ -324,7 +360,7 @@ class DevTrailMCPServer:
         if not entity:
             return {"entity": "", "related": [], "message": "No entity provided"}
 
-        conn = init_db()
+        conn = self._read_db()
         cursor = conn.execute(
             """
             SELECT entity_b, strength, context FROM entity_links
@@ -353,7 +389,7 @@ class DevTrailMCPServer:
         dry_run = args.get("dry_run", False)
         sources = args.get("sources", [])  # empty = all
 
-        conn = init_db()
+        conn = self._read_db()
         extractor = EntityExtractor()
         summarizer = SessionSummarizer()
         total = 0
@@ -501,7 +537,7 @@ class DevTrailMCPServer:
             "turns": turns,
         }
 
-        conn = init_db()
+        conn = self._read_db()
         extractor = EntityExtractor()
         summarizer = SessionSummarizer()
         importance_scorer = ImportanceScorer()
@@ -585,7 +621,7 @@ class DevTrailMCPServer:
         """Get high-importance sessions (score 3-5)."""
         min_score = args.get("min_score", 3)
         limit = args.get("limit", 20)
-        conn = init_db()
+        conn = self._read_db()
         results = get_sessions_by_importance(conn, min_importance=min_score, limit=limit)
         conn.close()
 
@@ -606,7 +642,7 @@ class DevTrailMCPServer:
 
     def tool_workspaces(self, args: Dict) -> Dict:
         """List all workspaces/departments and session counts."""
-        conn = init_db()
+        conn = self._read_db()
         cursor = conn.execute(
             "SELECT workspace, COUNT(*), AVG(importance) FROM sessions WHERE workspace IS NOT NULL GROUP BY workspace ORDER BY COUNT(*) DESC"
         )
@@ -636,7 +672,7 @@ class DevTrailMCPServer:
         workspace = args.get("workspace")
         format_type = args.get("format", "dict")  # dict, markdown, injection
 
-        conn = init_db()
+        conn = self._read_db()
 
         if session_id:
             # Single session compact
@@ -829,6 +865,20 @@ TOOLS = [
         "name": "devtrail_stats",
         "description": "Get DevTrail database statistics: session counts, tool breakdown, last extraction.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "devtrail_stella",
+        "description": "Local Stella topology store (persistent, T1 factual / T2 reflective + octa resonance). Sessions are mirrored in on capture. Actions: 'stats' for topology counts, 'query' for top-k recall with resonance partners.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "default": "stats", "description": "'stats', 'query', or 'parity'"},
+                "text": {"type": "string", "description": "Query text (for action=query/parity)"},
+                "k": {"type": "integer", "default": 4, "description": "Top-k results"},
+                "face": {"type": "string", "default": "ALL", "description": "T1, T2, or ALL"},
+                "backend": {"type": "string", "description": "flat|stella|shadow — overrides env default"},
+            },
+        },
     },
     {
         "name": "devtrail_related",

@@ -1,7 +1,10 @@
 """Database setup and operations for Cross-Tool Memory."""
 
+import os
 import sqlite3
 import json
+import threading
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
@@ -13,15 +16,55 @@ import sqlite_vec
 DB_PATH = Path.home() / ".dev-memory" / "memory.db"
 
 
-def init_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
-    """Initialize the database with all tables."""
+def _install_query_guard(conn: sqlite3.Connection, budget_s: float):
+    """Abort work on this connection after ~budget_s wall-clock.
+
+    Two mechanisms, because neither alone covers the failure modes:
+    - progress handler (op-count check) catches high-op-count statements
+      early — but LIKE over MB-size TEXT spends its wall time *inside* a
+      single likeFunc VDBE op and can run far past deadline between ticks.
+    - a threading.Timer calling conn.interrupt() — documented thread-safe —
+      which aborts even a statement stuck inside one op. If no statement is
+      running at deadline, interrupt() is a no-op.
+    Both surface as OperationalError('interrupted') to the caller.
+    """
+    deadline = time.monotonic() + budget_s
+
+    def _over_budget() -> int:
+        return 1 if time.monotonic() > deadline else 0
+
+    conn.set_progress_handler(_over_budget, 50_000)
+
+    def _fire():
+        try:
+            conn.interrupt()
+        except Exception:
+            pass
+
+    timer = threading.Timer(budget_s, _fire)
+    timer.daemon = True
+    timer.start()
+
+
+def init_db(db_path: Optional[Path] = None, query_budget_s: Optional[float] = None) -> sqlite3.Connection:
+    """Initialize the database with all tables.
+
+    query_budget_s: wall-clock ceiling for work on this connection; 0/None
+    means unlimited. Falls back to env DEVTRAIL_QUERY_BUDGET_S when unset.
+    Callers holding a connection for long batch work (extraction) should
+    leave it unbounded; request-scoped readers should pass a budget.
+    """
+    if query_budget_s is None:
+        query_budget_s = float(os.environ.get("DEVTRAIL_QUERY_BUDGET_S", "0"))
     db_path = db_path or DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     conn = sqlite3.connect(str(db_path))
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
+    if query_budget_s > 0:
+        _install_query_guard(conn, query_budget_s)
     
     conn.row_factory = sqlite3.Row
     
@@ -194,6 +237,19 @@ def insert_session(conn: sqlite3.Connection, session_data: Dict) -> str:
         ))
     
     conn.commit()
+
+    # Stella write-through: mirror the session into the local topology
+    # store. Best-effort — a sidecar failure must never break canonical
+    # SQLite writes.
+    try:
+        try:
+            from .stella_store import mirror_session
+        except ImportError:
+            from memory.stella_store import mirror_session
+        mirror_session(session_id, session_data)
+    except Exception:
+        pass
+
     return session_id
 
 
@@ -287,22 +343,55 @@ def insert_entity_links(conn: sqlite3.Connection, entities: List[Dict]):
     conn.commit()
 
 
+def _fetch_sessions_by_ids(conn: sqlite3.Connection, session_ids: List[str],
+                           workspace: Optional[str] = None,
+                           min_importance: Optional[int] = None) -> List[Dict]:
+    """Fetch full session rows for a list of session_ids, with the same
+    optional filters used by scoped search."""
+    if not session_ids:
+        return []
+    sql = f"SELECT * FROM sessions WHERE session_id IN ({','.join('?' * len(session_ids))})"
+    params: List = list(session_ids)
+    if workspace:
+        sql += " AND workspace = ?"
+        params.append(workspace)
+    if min_importance is not None:
+        sql += " AND importance >= ?"
+        params.append(min_importance)
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
 def search_sessions(conn: sqlite3.Connection, query: str, limit: int = 10) -> List[Dict]:
-    """Full-text search across sessions."""
-    # Simple LIKE search for now; can upgrade to FTS5 later
+    """Full-text search across sessions.
+
+    Two-phase: scan the small sessions table first, then only if needed a
+    bounded DISTINCT-session_id scan over turns. The previous single-query
+    form (sessions LEFT JOIN turns + OR'ed LIKEs + GROUP BY/ORDER BY) forced
+    SQLite to materialize and sort every joined row before LIMIT could
+    apply — a full byte-position LIKE scan over the entire turns table
+    (~hours on a multi-GB DB). The join's turn_content was never consumed.
+    """
     search_term = f"%{query}%"
-    
+
     cursor = conn.execute("""
-        SELECT s.*, t.content as turn_content
-        FROM sessions s
-        LEFT JOIN turns t ON s.session_id = t.session_id
-        WHERE s.summary LIKE ? OR s.raw_content LIKE ? OR t.content LIKE ?
-        GROUP BY s.session_id
-        ORDER BY s.started_at DESC
+        SELECT * FROM sessions
+        WHERE summary LIKE ? OR raw_content LIKE ?
+        ORDER BY started_at DESC
         LIMIT ?
-    """, (search_term, search_term, search_term, limit))
-    
-    return [dict(row) for row in cursor.fetchall()]
+    """, (search_term, search_term, limit))
+    hits = [dict(row) for row in cursor.fetchall()]
+
+    if len(hits) < limit:
+        seen = {h["session_id"] for h in hits}
+        cursor = conn.execute(
+            "SELECT DISTINCT session_id FROM turns WHERE content LIKE ? LIMIT ?",
+            (search_term, limit))
+        extra = [r[0] for r in cursor.fetchall() if r[0] not in seen]
+        if extra:
+            hits.extend(_fetch_sessions_by_ids(conn, extra))
+            hits.sort(key=lambda r: r.get("started_at") or "", reverse=True)
+
+    return hits[:limit]
 
 
 def get_recent_sessions(
@@ -454,26 +543,38 @@ def get_sessions_by_workspace(conn: sqlite3.Connection, workspace: str, limit: i
 
 def search_sessions_scoped(conn: sqlite3.Connection, query: str, workspace: Optional[str] = None,
                            min_importance: Optional[int] = None, limit: int = 10) -> List[Dict]:
-    """Search with workspace and importance filters."""
+    """Search with workspace and importance filters. Same two-phase shape
+    as search_sessions — see its docstring for why the join was removed."""
     search_term = f"%{query}%"
     sql = """
-        SELECT s.*, t.content as turn_content
-        FROM sessions s
-        LEFT JOIN turns t ON s.session_id = t.session_id
-        WHERE (s.summary LIKE ? OR s.raw_content LIKE ? OR t.content LIKE ?)
+        SELECT * FROM sessions
+        WHERE (summary LIKE ? OR raw_content LIKE ?)
     """
-    params = [search_term, search_term, search_term]
+    params = [search_term, search_term]
 
     if workspace:
-        sql += " AND s.workspace = ?"
+        sql += " AND workspace = ?"
         params.append(workspace)
 
     if min_importance is not None:
-        sql += " AND s.importance >= ?"
+        sql += " AND importance >= ?"
         params.append(min_importance)
 
-    sql += " GROUP BY s.session_id ORDER BY s.importance DESC, s.started_at DESC LIMIT ?"
+    sql += " ORDER BY importance DESC, started_at DESC LIMIT ?"
     params.append(limit)
 
-    cursor = conn.execute(sql, params)
-    return [dict(row) for row in cursor.fetchall()]
+    hits = [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    if len(hits) < limit:
+        seen = {h["session_id"] for h in hits}
+        cursor = conn.execute(
+            "SELECT DISTINCT session_id FROM turns WHERE content LIKE ? LIMIT ?",
+            (search_term, limit))
+        extra = [r[0] for r in cursor.fetchall() if r[0] not in seen]
+        if extra:
+            hits.extend(_fetch_sessions_by_ids(conn, extra, workspace=workspace,
+                                             min_importance=min_importance))
+            hits.sort(key=lambda r: (r.get("importance") or 0, r.get("started_at") or ""),
+                      reverse=True)
+
+    return hits[:limit]
