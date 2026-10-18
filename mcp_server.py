@@ -17,6 +17,7 @@ To use:
 import json
 import sys
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -31,7 +32,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from memory.db import (
     init_db, search_sessions, search_sessions_scoped, get_recent_sessions, get_entities,
     get_active_decisions, get_stats, get_sessions_by_importance, get_sessions_by_workspace,
-    DB_PATH
+    pin_survivor, get_valid_survivors, DB_PATH
 )
 from memory.extractors import (
     DevinLocalExtractor, CursorExtractor, VSCodeCopilotExtractor,
@@ -49,6 +50,17 @@ BACKGROUND_EXTRACT_MIN_AGE = 5    # Minutes: don't re-extract if done this recen
 # is single-threaded — one pathological query (leading-wildcard LIKE over a
 # multi-GB turns table) would otherwise wedge every subsequent MCP call.
 QUERY_BUDGET_S = float(os.environ.get("DEVTRAIL_QUERY_BUDGET_S", "15"))
+
+# Context-pressure reflex (advisory only — never gates behavior).
+# CONTEXT_WINDOW_BYTES: assumed live-context capacity in bytes (~4 chars/token
+# for English). The live-session probe reads the Devin sessions.db; a read-only
+# WAL snapshot can lag the newest un-checkpointed turns, and under concurrent
+# windows it may measure the wrong session — the served-byte counter is the
+# floor via max(). Tune with DEVTRAIL_CONTEXT_WINDOW_BYTES / _WARN_PCT.
+CONTEXT_WINDOW_BYTES = int(os.environ.get("DEVTRAIL_CONTEXT_WINDOW_BYTES", "4000000"))
+CONTEXT_WARN_PCT = float(os.environ.get("DEVTRAIL_CONTEXT_WARN_PCT", "0.75"))
+DEVIN_SESSIONS_DB = Path.home() / ".local" / "share" / "devin" / "cli" / "sessions.db"
+ORIENT_MAX_BYTES = 2048
 
 # ── MCP Protocol Helpers ────────────────────────────────────────────────────
 
@@ -87,6 +99,8 @@ class DevTrailMCPServer:
         self._last_extract_time: Optional[datetime] = None
         self._extract_lock = threading.Lock()
         self._db_path = DB_PATH
+        self._sessions_db = DEVIN_SESSIONS_DB
+        self._ctx_bytes = 0  # cumulative tool args+result bytes this process
 
     def _read_db(self):
         """Request-scoped DB connection for tool handlers — bounded so a
@@ -802,6 +816,226 @@ class DevTrailMCPServer:
         else:
             return {"compact": aggregate, "workspace": aggregate["workspace"]}
 
+    # ── Survivor records (pin / orient / context reflex) ──────────────────
+
+    def _receipt_exists(self, ref: str, repo: Optional[str]):
+        """True iff `ref` resolves to an existing file or a git object.
+        Relative paths resolve against `repo` then the server cwd."""
+        roots = []
+        if repo:
+            roots.append(Path(repo).expanduser())
+        roots.append(Path.cwd())
+        try:
+            p = Path(ref).expanduser()
+            if p.is_absolute():
+                if p.exists():
+                    return True, "file"
+            else:
+                for r in roots:
+                    if (r / p).exists():
+                        return True, "file"
+        except OSError:
+            pass
+        # cat-file -e is a real existence check — `rev-parse --verify` is
+        # syntax-only for full-length hex and accepts nonexistent SHAs.
+        if not ref.startswith("-"):
+            for r in roots:
+                try:
+                    res = subprocess.run(
+                        ["git", "-C", str(r), "cat-file", "-e", ref],
+                        capture_output=True, timeout=5)
+                    if res.returncode == 0:
+                        return True, "git"
+                except Exception:
+                    pass
+        return False, None
+
+    def tool_pin_survivor(self, args: Dict) -> Dict:
+        """Pin a verified survivor record — a small claim bound to an existing
+        receipt. The receipt-existence gate is the whole design against
+        immortal hallucinations: no resolvable receipt, no write."""
+        domain_key = (args.get("domain_key") or "").strip()
+        claim = args.get("claim") or ""
+        receipt_ref = (args.get("receipt_ref") or "").strip()
+        watched_files = args.get("watched_files") or []
+        supersedes_id = args.get("supersedes_id")
+        repo = args.get("repo")  # optional resolution root
+
+        if not domain_key:
+            return {"error": "domain_key is required"}
+        if not claim:
+            return {"error": "claim is required"}
+        if len(claim) > 500:
+            return {"error": f"claim is {len(claim)} chars — cap is 500; shorten it"}
+        if not receipt_ref:
+            return {"error": "receipt_ref is required"}
+        if not isinstance(watched_files, list) or not all(
+                isinstance(f, str) for f in watched_files):
+            return {"error": "watched_files must be a list of repo-relative paths"}
+
+        ok, kind = self._receipt_exists(receipt_ref, repo)
+        if not ok:
+            return {"error": f"receipt_ref {receipt_ref!r} resolves to nothing — "
+                             "write rejected (needs an existing file or git object)"}
+
+        conn = self._read_db()
+        try:
+            new_id = pin_survivor(conn, domain_key, claim, receipt_ref,
+                                  watched_files=watched_files,
+                                  supersedes_id=supersedes_id)
+        finally:
+            conn.close()
+        return {"id": new_id, "status": "VALID", "receipt_kind": kind}
+
+    def _git(self, cwd: Path, argv: List[str]) -> str:
+        try:
+            res = subprocess.run(["git", "-C", str(cwd)] + argv,
+                                 capture_output=True, text=True, timeout=5)
+            return res.stdout.strip() if res.returncode == 0 else ""
+        except Exception:
+            return ""
+
+    def _survivor_stale(self, repo: Path, rec: Dict) -> bool:
+        """True if any watched file's newest commit postdates the record.
+        Advisory only — never writes status back to the DB."""
+        try:
+            files = json.loads(rec.get("watched_files") or "[]")
+            created = datetime.fromisoformat(rec["created_at"])
+        except Exception:
+            return False
+        for rel in files:
+            p = Path(rel).expanduser()
+            f = p if p.is_absolute() else repo / rel
+            last = self._git(f.parent, ["log", "-1", "--format=%cI", "--", str(f)])
+            if not last:
+                continue
+            try:
+                if datetime.fromisoformat(last) > created:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def tool_orient(self, args: Dict) -> Dict:
+        """Deterministic <2KB hydration block: active goal + current subgoal,
+        VALID survivor records (<=10 per domain_key, newest first, [STALE?] on
+        watched-file drift), git status + last 3 commits for the active repo.
+        No raw session dumps, no FTS."""
+        repo = Path(args.get("repo") or os.getcwd()).expanduser()
+        conn = self._read_db()
+        try:
+            block = self._build_orient_block(conn, repo)
+        finally:
+            conn.close()
+        return {"orient": block, "bytes": len(block.encode())}
+
+    def _build_orient_block(self, conn, repo: Path) -> str:
+        lines: List[str] = ["▶ ORIENT"]
+
+        # (a) active goal + current subgoal — project .devin state, best-effort
+        try:
+            goals = json.loads((repo / ".devin" / "active_goals.json").read_text())
+            for g in goals.get("goals", []):
+                if g.get("status") == "active":
+                    lines.append(f"goal: {(g.get('objective') or '')[:110]}")
+        except Exception:
+            pass
+        try:
+            bank = json.loads((repo / ".devin" / "memory-bank.json").read_text())
+            subs = (bank.get("status") or {}).get("open_subgoals") or []
+            for s in subs[:2]:
+                name = Path(str(s)).name or str(s)
+                lines.append(f"subgoal: {name[:90]}")
+        except Exception:
+            pass
+
+        # (b)+(d) VALID survivor records, <=10 per domain_key, [STALE?] on drift
+        survivors = get_valid_survivors(conn, per_domain=10)
+        if survivors:
+            lines.append("▶ SURVIVORS")
+            for rec in survivors:
+                claim = rec["claim"][:140] + ("…" if len(rec["claim"]) > 140 else "")
+                stale = "[STALE?] " if self._survivor_stale(repo, rec) else ""
+                lines.append(f"{stale}{rec['domain_key']}#{rec['id']}: {claim}")
+
+        # (c) git status + last 3 commits for the active repo
+        if self._git(repo, ["rev-parse", "--is-inside-work-tree"]) == "true":
+            lines.append(f"▶ GIT {repo.name}")
+            status = self._git(repo, ["status", "--short"])
+            if status:
+                st = status.splitlines()
+                lines.extend(l[:100] for l in st[:8])
+                if len(st) > 8:
+                    lines.append(f"…+{len(st) - 8} more")
+            for l in (self._git(repo, ["log", "-3", "--format=%h %s"]) or "").splitlines():
+                lines.append(l[:120])
+
+        block = "\n".join(lines)
+        if len(block.encode()) > ORIENT_MAX_BYTES:
+            block = block.encode()[:ORIENT_MAX_BYTES - 2].decode(errors="ignore") + "…"
+        return block
+
+    def _live_session_bytes(self) -> Optional[int]:
+        """Byte-sum of the live ancestor chain of the most relevant Devin
+        session — the context-pressure signal. Walking parent_node_id keeps
+        the measure to live context (dead branches/dropped turns excluded);
+        indexed, depth-capped at 4000, read-only. A WAL snapshot can lag the
+        newest turns; None when unavailable."""
+        if not self._sessions_db.exists():
+            return None
+        import sqlite3
+        for uri in (f"file:{self._sessions_db}?mode=ro",
+                    f"file:{self._sessions_db}?mode=ro&immutable=1"):
+            try:
+                conn = sqlite3.connect(uri, uri=True, timeout=0)
+                try:
+                    row = conn.execute(
+                        "SELECT id FROM sessions ORDER BY (working_directory = ?) "
+                        "DESC, last_activity_at DESC LIMIT 1",
+                        (os.getcwd(),)).fetchone()
+                    if not row:
+                        return None
+                    sid = row[0]
+                    r = conn.execute("""
+                        WITH RECURSIVE chain(rid, parent, n) AS (
+                          SELECT row_id, parent_node_id, LENGTH(chat_message) FROM (
+                            SELECT row_id, parent_node_id, chat_message
+                            FROM message_nodes
+                            WHERE session_id=? ORDER BY row_id DESC LIMIT 1)
+                          UNION ALL
+                          SELECT m.row_id, m.parent_node_id,
+                                 LENGTH(m.chat_message)
+                            FROM message_nodes m JOIN chain c
+                              ON m.session_id = ? AND m.node_id = c.parent
+                        )
+                        SELECT COALESCE(SUM(n),0) FROM
+                            (SELECT n FROM chain LIMIT 4000)
+                    """, (sid, sid)).fetchone()
+                    return int(r[0])
+                finally:
+                    conn.close()
+            except Exception:
+                continue
+        return None
+
+    def _estimate_context_pct(self) -> float:
+        """Coarse live-context estimate as a fraction. Advisory — feeds only
+        the >75% pin reminder, never a decision."""
+        live = self._live_session_bytes() or 0
+        return max(self._ctx_bytes, live) / CONTEXT_WINDOW_BYTES
+
+    def _append_ctx_warning(self, content: List[Dict]) -> None:
+        """Append the >75% reminder as a separate content item so the primary
+        text stays parseable JSON."""
+        try:
+            pct = self._estimate_context_pct()
+        except Exception:
+            return
+        if pct >= CONTEXT_WARN_PCT:
+            content.append({"type": "text", "text":
+                f"[SYSTEM: context ~{pct * 100:.0f}% — compaction imminent; "
+                "pin_survivor() any unrecorded verified findings NOW]"})
+
 
 # ── Tool Schema Definitions ────────────────────────────────────────────────
 
@@ -996,6 +1230,33 @@ TOOLS = [
             },
         },
     },
+    {
+        # Unprefixed per spec — dispatch maps it to tool_pin_survivor.
+        "name": "pin_survivor",
+        "description": "Pin a verified survivor record: a small claim (<=500 chars, rejected not truncated) bound to an existing receipt — a file path (absolute preferred; relative resolves against repo then server cwd) or a git object/SHA verified via cat-file -e (rev-parse --verify is syntax-only for full hex — cat-file actually checks the object db). The receipt-existence gate is the design: no receipt, no write. supersedes_id marks the old record OBSOLETE in the same transaction. watched_files (repo-relative paths) earn a [STALE?] flag in devtrail_orient when they drift.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "domain_key": {"type": "string", "description": "Domain bucket, e.g. 'v2d/t2-pilot' or 'devtrail/db'"},
+                "claim": {"type": "string", "description": "The verified finding, <=500 chars"},
+                "receipt_ref": {"type": "string", "description": "Existing file path or git SHA — must resolve at write time"},
+                "watched_files": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Repo-relative paths whose later commits flag the record [STALE?]"},
+                "supersedes_id": {"type": "integer", "description": "Record id to mark OBSOLETE in the same transaction"},
+                "repo": {"type": "string", "description": "Optional repo root for resolving relative receipts and git objects"},
+            },
+            "required": ["domain_key", "claim", "receipt_ref"],
+        },
+    },
+    {
+        "name": "devtrail_orient",
+        "description": "Deterministic <2KB hydration block: active goal + current subgoal (from .devin/), VALID survivor records (<=10 per domain_key, newest first, [STALE?] when a watched file drifted), git status + last 3 commits for the active repo. No raw session dumps, no FTS over transcripts.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Active repo root. Defaults to the server's cwd."},
+            },
+        },
+    },
 ]
 
 
@@ -1037,13 +1298,16 @@ def main():
             name = params.get("name", "")
             arguments = params.get("arguments", {})
             handler_name = f"tool_{name.replace('devtrail_', '')}"
+            server._ctx_bytes += len(json.dumps(arguments, default=str))
 
             if hasattr(server, handler_name):
                 try:
                     result = getattr(server, handler_name)(arguments)
-                    _send(_make_response(req_id, {
-                        "content": [{"type": "text", "text": json.dumps(result, indent=2, default=str)}]
-                    }))
+                    text = json.dumps(result, indent=2, default=str)
+                    server._ctx_bytes += len(text)
+                    content = [{"type": "text", "text": text}]
+                    server._append_ctx_warning(content)
+                    _send(_make_response(req_id, {"content": content}))
                 except Exception as e:
                     _send(_make_response(req_id, {
                         "content": [{"type": "text", "text": json.dumps({"error": str(e)}, indent=2)}],

@@ -6,7 +6,7 @@ import json
 import threading
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 import numpy as np
 
@@ -184,6 +184,22 @@ def init_db(db_path: Optional[Path] = None, query_budget_s: Optional[float] = No
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_activity_path ON file_activity(file_path)")
+
+    # Survivor records — designated-item verified pins bound to receipts.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS survivor_records (
+            id INTEGER PRIMARY KEY,
+            domain_key TEXT NOT NULL,
+            claim TEXT NOT NULL,
+            receipt_ref TEXT NOT NULL,
+            watched_files TEXT,
+            supersedes_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'VALID',
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_survivor_domain ON survivor_records(domain_key, status, created_at)")
 
     # ── Schema migrations (safe for existing DBs) ─────────────────────────
     _migrate_sessions(conn)
@@ -578,3 +594,44 @@ def search_sessions_scoped(conn: sqlite3.Connection, query: str, workspace: Opti
                       reverse=True)
 
     return hits[:limit]
+
+
+SURVIVOR_CLAIM_MAX = 500
+
+
+def pin_survivor(conn: sqlite3.Connection, domain_key: str, claim: str,
+                 receipt_ref: str, watched_files: Optional[List[str]] = None,
+                 supersedes_id: Optional[int] = None) -> int:
+    """Insert a survivor record, marking `supersedes_id` OBSOLETE in the same
+    transaction. Receipt existence is validated by the caller (it needs
+    filesystem/git access); the claim cap is enforced here as well."""
+    if len(claim) > SURVIVOR_CLAIM_MAX:
+        raise ValueError(f"claim is {len(claim)} chars; cap is {SURVIVOR_CLAIM_MAX}")
+    now = datetime.now(timezone.utc).isoformat()
+    with conn:  # atomic: supersede + insert commit or roll back together
+        if supersedes_id is not None:
+            conn.execute(
+                "UPDATE survivor_records SET status='OBSOLETE', updated_at=? WHERE id=?",
+                (now, supersedes_id))
+        cursor = conn.execute("""
+            INSERT INTO survivor_records
+                (domain_key, claim, receipt_ref, watched_files, supersedes_id,
+                 status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'VALID', ?, ?)
+        """, (domain_key, claim, receipt_ref, json.dumps(watched_files or []),
+              supersedes_id, now, now))
+    return cursor.lastrowid
+
+
+def get_valid_survivors(conn: sqlite3.Connection, per_domain: int = 10) -> List[Dict]:
+    """VALID survivor records — at most `per_domain` most recent per domain_key."""
+    cursor = conn.execute("""
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY domain_key ORDER BY created_at DESC, id DESC
+            ) AS rn
+            FROM survivor_records WHERE status = 'VALID'
+        ) WHERE rn <= ?
+        ORDER BY domain_key, rn
+    """, (per_domain,))
+    return [dict(r) for r in cursor.fetchall()]
